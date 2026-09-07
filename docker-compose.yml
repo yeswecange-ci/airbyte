@@ -1,315 +1,65 @@
-# YesWeSync — Docker Compose pour Airbyte 2.2.0
-# Compatible Coolify + DigitalOcean
+# YesWeSync — Docker Compose pour Coolify
 #
-# Services : db · temporal · bootloader · server · worker · webapp
-#            connector-builder-server · cron · proxy
+# IMPORTANT : Ce compose NE décompose PAS Airbyte en services séparés.
+# Airbyte 2.2.0 utilise abctl → kind → Kubernetes.
+# Ce compose gère uniquement :
+#   1. Le container de gestion abctl (qui installe Airbyte via kind)
+#   2. Le PostgreSQL de staging (destination des syncs → YesWeReport)
 #
-# Toutes les images sont les images officielles Airbyte 2.2.0 non modifiées,
-# sauf "server" qui utilise notre Dockerfile de couche de déploiement.
-# Aucun code Airbyte n'est modifié.
-
-x-logging: &default-logging
-  options:
-    max-size: "100m"
-    max-file: "5"
-  driver: json-file
-
-volumes:
-  # Metadata Airbyte (base PostgreSQL interne)
-  airbyte-db-data:
-    name: airbyte-db-data
-
-  # Workspace Airbyte (jobs, logs, artefacts de sync)
-  airbyte-workspace:
-    name: airbyte-workspace
-
-  # Données de configuration Airbyte
-  airbyte-data:
-    name: airbyte-data
-
-  # Logs Airbyte
-  airbyte-logs:
-    name: airbyte-logs
-
-  # Temporal persistence
-  temporal-db-data:
-    name: temporal-db-data
-
-  # Staging PostgreSQL (destination des syncs → YesWeReport)
-  staging-db-data:
-    name: yeswesync-staging-db-data
-
-networks:
-  airbyte-internal:
-    name: airbyte-internal
-  airbyte-public:
-    name: airbyte-public
+# Airbyte lui-même tourne dans un cluster kind créé par abctl sur l'hôte Docker.
 
 services:
 
-  # ── Metadata PostgreSQL (usage interne Airbyte uniquement) ──────────────────
-  db:
-    image: airbyte/db:2.2.0
-    logging: *default-logging
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${DATABASE_DB:-db}
-      POSTGRES_USER: ${DATABASE_USER}
-      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
-    volumes:
-      - airbyte-db-data:/var/lib/postgresql/data
-    networks:
-      - airbyte-internal
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-airbyte} -d ${DATABASE_DB:-db}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  # ── Temporal (orchestration des workflows Airbyte) ─────────────────────────
-  temporal:
-    image: temporalio/auto-setup:1.23.0
-    logging: *default-logging
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - DB=postgresql
-      - DB_PORT=5432
-      - POSTGRES_USER=${DATABASE_USER}
-      - POSTGRES_PWD=${DATABASE_PASSWORD}
-      - POSTGRES_SEEDS=db
-      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development.yaml
-    volumes:
-      - ./temporal-dynamicconfig:/etc/temporal/config/dynamicconfig
-    networks:
-      - airbyte-internal
-    healthcheck:
-      test: ["CMD", "tctl", "--address", "temporal:7233", "workflow", "list"]
-      interval: 10s
-      timeout: 10s
-      retries: 20
-      start_period: 60s
-
-  # ── Bootloader (migrations DB Airbyte — s'arrête après exécution) ──────────
-  bootloader:
-    image: airbyte/bootloader:2.2.0
-    logging: *default-logging
-    restart: "no"
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-2.2.0}
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
-      DATABASE_URL: jdbc:postgresql://db:5432/${DATABASE_DB:-db}
-      DATABASE_USER: ${DATABASE_USER}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    networks:
-      - airbyte-internal
-
-  # ── Server (API Airbyte — notre Dockerfile de couche déploiement) ──────────
-  server:
+  # ── Gestionnaire abctl — installe et supervise Airbyte 2.2.0 via kind ────────
+  airbyte-manager:
     build:
       context: .
       dockerfile: Dockerfile
-    image: yeswesync-server:2.2.0
-    logging: *default-logging
+    image: yeswesync-manager:0.30.4
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-      temporal:
-        condition: service_healthy
-      bootloader:
-        condition: service_completed_successfully
-    environment:
-      AIRBYTE_ROLE: ${AIRBYTE_ROLE:-community}
-      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-2.2.0}
-      AUTO_DETECT_SCHEMA: ${AUTO_DETECT_SCHEMA:-true}
-      CONFIG_ROOT: /data
-      DATABASE_DB: ${DATABASE_DB:-db}
-      DATABASE_HOST: db
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
-      DATABASE_PORT: 5432
-      DATABASE_USER: ${DATABASE_USER}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      SECRET_PERSISTENCE: ${SECRET_PERSISTENCE:-TESTING_CONFIG_DB_SECRET}
-      TEMPORAL_HOST: temporal:7233
-      TRACKING_STRATEGY: ${TRACKING_STRATEGY:-logging}
-      WEBAPP_URL: ${WEBAPP_URL:-http://localhost}
-      WORKER_ENVIRONMENT: ${WORKER_ENVIRONMENT:-docker}
-      WORKSPACE_DOCKER_MOUNT: airbyte-workspace
-      WORKSPACE_ROOT: /tmp/workspace
+    privileged: true                      # Requis : kind nécessite cgroups
     volumes:
-      - airbyte-workspace:/tmp/workspace
-      - airbyte-data:/data
-      - airbyte-logs:/tmp/logs
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - airbyte-internal
-    ports:
-      - "8001:8001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 20
-      start_period: 90s
-
-  # ── Worker (exécution des jobs de synchronisation) ─────────────────────────
-  worker:
-    image: airbyte/worker:2.2.0
-    logging: *default-logging
-    restart: unless-stopped
-    depends_on:
-      server:
-        condition: service_healthy
+      - /var/run/docker.sock:/var/run/docker.sock  # Socket Docker hôte
+      - airbyte-abctl-home:/root/.airbyte           # Données abctl persistantes
     environment:
-      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-2.2.0}
-      AUTO_DETECT_SCHEMA: ${AUTO_DETECT_SCHEMA:-true}
-      CONFIG_ROOT: /data
-      DATABASE_DB: ${DATABASE_DB:-db}
-      DATABASE_HOST: db
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
-      DATABASE_PORT: 5432
-      DATABASE_USER: ${DATABASE_USER}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      SECRET_PERSISTENCE: ${SECRET_PERSISTENCE:-TESTING_CONFIG_DB_SECRET}
-      TEMPORAL_HOST: temporal:7233
-      TRACKING_STRATEGY: ${TRACKING_STRATEGY:-logging}
-      WEBAPP_URL: ${WEBAPP_URL:-http://localhost}
-      WORKER_ENVIRONMENT: ${WORKER_ENVIRONMENT:-docker}
-      WORKSPACE_DOCKER_MOUNT: airbyte-workspace
-      WORKSPACE_ROOT: /tmp/workspace
-    volumes:
-      - airbyte-workspace:/tmp/workspace
-      - airbyte-data:/data
-      - airbyte-logs:/tmp/logs
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - airbyte-internal
+      AIRBYTE_URL: ${AIRBYTE_URL}
+      AIRBYTE_PORT: ${AIRBYTE_PORT:-8085}
+      AIRBYTE_INITIAL_USER_PASSWORD: ${AIRBYTE_INITIAL_USER_PASSWORD}
+      AIRBYTE_INSTALLATION_ID: ${AIRBYTE_INSTALLATION_ID:-}
+      AIRBYTE_JOB_CPU_LIMIT: ${AIRBYTE_JOB_CPU_LIMIT:-3}
+      AIRBYTE_JOB_MEMORY_LIMIT: ${AIRBYTE_JOB_MEMORY_LIMIT:-4Gi}
+      ABCTL_EXTRA_FLAGS: ${ABCTL_EXTRA_FLAGS:-}
+    # Ne pas exposer de port ici — Airbyte est exposé par kind directement
+    # sur l'hôte (port AIRBYTE_PORT). Coolify proxy → localhost:AIRBYTE_PORT.
+    network_mode: "host"                  # Nécessaire pour que abctl/kind
+                                          # ait accès au réseau de l'hôte
 
-  # ── Webapp (UI Airbyte officielle, non modifiée) ───────────────────────────
-  webapp:
-    image: airbyte/webapp:2.2.0
-    logging: *default-logging
-    restart: unless-stopped
-    depends_on:
-      server:
-        condition: service_healthy
-    environment:
-      AIRBYTE_SERVER_HOST: server
-      AIRBYTE_SERVER_PORT: 8001
-      AIRBYTE_SERVER_HTTPS: "false"
-      TRACKING_STRATEGY: ${TRACKING_STRATEGY:-logging}
-    networks:
-      - airbyte-internal
-      - airbyte-public
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/"]
-      interval: 10s
-      timeout: 5s
-      retries: 15
-      start_period: 30s
-
-  # ── Connector Builder Server ────────────────────────────────────────────────
-  connector-builder-server:
-    image: airbyte/connector-builder-server:2.2.0
-    logging: *default-logging
-    restart: unless-stopped
-    depends_on:
-      server:
-        condition: service_healthy
-    environment:
-      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-2.2.0}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      CDK_VERSION: 0.80.0
-    networks:
-      - airbyte-internal
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/v1/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-
-  # ── Cron (tâches planifiées Airbyte) ──────────────────────────────────────
-  cron:
-    image: airbyte/cron:2.2.0
-    logging: *default-logging
-    restart: unless-stopped
-    depends_on:
-      server:
-        condition: service_healthy
-    environment:
-      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-2.2.0}
-      CONFIG_ROOT: /data
-      DATABASE_DB: ${DATABASE_DB:-db}
-      DATABASE_HOST: db
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
-      DATABASE_PORT: 5432
-      DATABASE_USER: ${DATABASE_USER}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      TEMPORAL_HOST: temporal:7233
-      TRACKING_STRATEGY: ${TRACKING_STRATEGY:-logging}
-      WORKSPACE_ROOT: /tmp/workspace
-    volumes:
-      - airbyte-workspace:/tmp/workspace
-      - airbyte-data:/data
-    networks:
-      - airbyte-internal
-
-  # ── Proxy Nginx (expose webapp + API sur un seul port — Coolify fera le TLS)
-  proxy:
-    image: airbyte/proxy:2.2.0
-    logging: *default-logging
-    restart: unless-stopped
-    depends_on:
-      webapp:
-        condition: service_healthy
-      server:
-        condition: service_healthy
-      connector-builder-server:
-        condition: service_healthy
-    environment:
-      BASIC_AUTH_USERNAME: ${BASIC_AUTH_USERNAME:-yeswesync}
-      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD}
-      BASIC_AUTH_PROXY_TIMEOUT: ${BASIC_AUTH_PROXY_TIMEOUT:-900}
-    ports:
-      - "${PROXY_PORT:-8000}:8000"
-      - "${PROXY_HTTPS_PORT:-8443}:8443"
-    networks:
-      - airbyte-internal
-      - airbyte-public
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-  # ── Staging PostgreSQL (destination des syncs → YesWeReport) ──────────────
-  # NOTE: Si vous avez déjà un PostgreSQL de staging externe, supprimez ce
-  # service et configurez STAGING_DATABASE_URL directement.
+  # ── Staging PostgreSQL — destination des syncs → YesWeReport ─────────────────
+  # Base séparée de la metadata DB Airbyte (gérée par abctl/kind en interne)
   staging-db:
     image: postgres:15-alpine
-    logging: *default-logging
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${STAGING_DB:-yeswesync_staging}
       POSTGRES_USER: ${STAGING_USER}
       POSTGRES_PASSWORD: ${STAGING_PASSWORD}
     volumes:
-      - type: volume
-        source: staging-db-data
-        target: /var/lib/postgresql/data
-    networks:
-      - airbyte-internal
+      - staging-db-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${STAGING_PORT:-5433}:5432"   # Accès local uniquement
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${STAGING_USER:-staging} -d ${STAGING_DB:-yeswesync_staging}"]
       interval: 10s
       timeout: 5s
       retries: 10
 
+volumes:
+  # Données abctl : kubeconfig kind, données Helm, PVs Kubernetes
+  # CRITIQUE — ne jamais supprimer ce volume
+  airbyte-abctl-home:
+    name: yeswesync-abctl-home
+
+  # Données staging PostgreSQL → YesWeReport
+  # CRITIQUE — contient les données métier
+  staging-db-data:
+    name: yeswesync-staging-db-data

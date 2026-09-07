@@ -1,277 +1,371 @@
 # YesWeSync — Guide de déploiement production
-## Coolify + DigitalOcean — Airbyte 2.2.0
+## abctl 0.30.4 + Airbyte 2.2.0 sur DigitalOcean + Coolify
 
 ---
 
-## Architecture
+## Architecture réelle d'Airbyte 2.2.0
 
 ```
-DigitalOcean Droplet
-└── Coolify
-    └── Docker Compose (yeswecange-ci/airbyte)
-        ├── proxy          → port 8000 (HTTP, Coolify gère HTTPS/TLS)
-        ├── webapp         → UI Airbyte officielle
-        ├── server         → API Airbyte (notre wrapper mince)
-        ├── worker         → exécution des syncs
-        ├── connector-builder-server
-        ├── cron
-        ├── temporal       → orchestration des workflows
-        └── db             → PostgreSQL metadata Airbyte (interne)
-        └── staging-db     → PostgreSQL destination (→ YesWeReport)
+abctl v0.30.4  ← binaire Go qui orchestre tout
+  └── kind (Kubernetes dans Docker)
+        └── cluster "airbyte-abctl"  ← 1 container Docker = 1 nœud K8s
+              namespace: airbyte-abctl
+                server            → API Airbyte
+                worker            → gestion des workloads
+                workload-launcher → crée des Pods K8s pour chaque sync
+                manifest-server   → Connector Builder
+                temporal          → orchestration
+                cron
+                db                → PostgreSQL metadata (interne Airbyte)
+                ingress-nginx     → expose le port sur l'hôte
 ```
 
-**Principe absolu :** Airbyte est le moteur officiel intact. On déploie autour. On ne modifie pas Airbyte.
+**WORKER_ENVIRONMENT=kubernetes** : chaque sync crée de vrais Pods Kubernetes.
+Ce n'est pas du Docker Compose. Ce n'est pas configurable autrement sans modifier Airbyte.
+
+---
+
+## Ce que fait ce repository
+
+Ce repository adapte NOTRE déploiement à Airbyte 2.2.0. Il ne modifie pas Airbyte.
+
+```
+Dockerfile
+  └── installe abctl v0.30.4 (gestionnaire officiel Airbyte)
+
+entrypoint.sh
+  └── génère les valeurs Helm depuis les variables d'environnement
+  └── appelle : abctl local install --chart-version 2.2.0
+  └── supervise Airbyte (monitoring + restart)
+
+docker-compose.yml
+  ├── airbyte-manager  ← container qui exécute abctl
+  └── staging-db       ← PostgreSQL de staging (→ YesWeReport)
+```
+
+---
+
+## Architecture de déploiement sur DigitalOcean
+
+```
+DigitalOcean Droplet (Ubuntu 22.04, 8 Go RAM min)
+│
+├── Coolify (reverse proxy Traefik)
+│   ├── yeswesync.votre-domaine.com → localhost:8085 (Airbyte via kind)
+│   └── Docker Compose (ce repo)
+│       ├── airbyte-manager  [privileged, Docker socket]
+│       │     └── abctl → crée/supervise le cluster kind
+│       └── staging-db       [PostgreSQL 15, port 5433]
+│
+└── Containers Docker créés par abctl (visibles dans "docker ps")
+    └── airbyte-abctl-control-plane  ← nœud kind, expose :8085
+```
 
 ---
 
 ## Volumes persistants
 
-| Volume | Service | Mount path | Contenu | Critique |
-|--------|---------|-----------|---------|----------|
-| `airbyte-db-data` | db | `/var/lib/postgresql/data` | Metadata Airbyte (sources, destinations, connections, credentials) | **OUI** |
-| `airbyte-workspace` | server, worker | `/tmp/workspace` | Artefacts des jobs de sync | Moyen |
-| `airbyte-data` | server, worker | `/data` | Config Airbyte runtime | **OUI** |
-| `airbyte-logs` | server, worker | `/tmp/logs` | Logs des syncs | Non |
-| `temporal-db-data` | temporal | `/var/lib/postgresql/data` | État des workflows Temporal | **OUI** |
-| `yeswesync-staging-db-data` | staging-db | `/var/lib/postgresql/data` | Données de staging (→ YesWeReport) | **OUI** |
+| Volume | Contenu | Critique |
+|--------|---------|----------|
+| `yeswesync-abctl-home` → `/root/.airbyte` | kubeconfig kind, données Helm, PVs K8s (metadata Airbyte, workspace) | **OUI** |
+| `yeswesync-staging-db-data` → `/var/lib/postgresql/data` | Données de staging (sources, destinations) | **OUI** |
 
-> **Ne jamais faire** `docker volume rm`, `docker compose down -v`, ni `docker system prune --volumes`.
+Les PVs Kubernetes d'Airbyte sont à l'intérieur du volume `yeswesync-abctl-home` :
+```
+/root/.airbyte/abctl/data/
+  airbyte-local-pv/    → workspace jobs, logs
+  airbyte-volume-db/   → PostgreSQL metadata Airbyte
+```
+
+> **Ne jamais faire** `docker volume rm yeswesync-abctl-home`.
 
 ---
 
 ## Séparation des bases de données
 
 ```
-Airbyte metadata DB (db)          ← usage Airbyte interne UNIQUEMENT
-    airbyte-db-data
+Metadata DB Airbyte
+  → dans le cluster kind (airbyte-db-svc:5432, interne)
+  → dans /root/.airbyte/abctl/data/airbyte-volume-db/
+  → USAGE AIRBYTE UNIQUEMENT — YesWeReport ne touche jamais cette base
 
-Staging DB (staging-db)           ← destination des syncs Meta Ads etc.
-    yeswesync-staging-db-data
-         ↓
-    YesWeReport lit cette base
+Staging DB (ce repo)
+  → staging-db container (localhost:5433)
+  → dans yeswesync-staging-db-data
+  → YesWeReport lit CETTE base uniquement
 ```
-
-YesWeReport **ne doit jamais lire** la metadata DB Airbyte.
 
 ---
 
 ## Déploiement initial (étape par étape)
 
-### 1. Serveur DigitalOcean
+### 1. Créer le Droplet DigitalOcean
 
-Minimum recommandé pour Airbyte 2.2.0 :
+Minimum recommandé :
 - **CPU :** 4 vCPU
-- **RAM :** 8 Go (16 Go recommandé)
-- **Disque :** 100 Go SSD (volumes Docker persistants)
+- **RAM :** 8 Go (16 Go recommandé — abctl + kind + Pods K8s)
+- **Disque :** 100 Go SSD
 - **OS :** Ubuntu 22.04
+
+> kind (Kubernetes) consomme ~3-4 Go de RAM au repos.
 
 ### 2. Installer Coolify sur le Droplet
 
-Suivre la documentation officielle : https://coolify.io/docs/installation
+```bash
+curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash
+```
 
-### 3. Ouvrir Coolify → Nouveau projet
+Accéder à Coolify : `http://IP_DROPLET:8000`
 
-`Projects` → `New Project` → nommer `yeswesync`
+### 3. Configurer le projet dans Coolify
+
+```
+Projects → New Project → "yeswesync"
+```
 
 ### 4. Ajouter le repository
 
 ```
-Source: GitHub
-Repository: yeswecange-ci/airbyte
+New Resource → Docker Compose → From Git Repository
+Repository: https://github.com/yeswecange-ci/airbyte
 Branch: main
 ```
 
-### 5. Choisir le mode de déploiement
+### 5. Configurer le container `airbyte-manager` comme privilégié
 
-Coolify détectera le `docker-compose.yml` à la racine.
+Dans Coolify → Service `airbyte-manager` → Advanced :
+- **Privileged: ON** (requis pour kind/cgroups)
+- **Docker socket: /var/run/docker.sock** (déjà dans le compose)
 
-Sélectionner : **Docker Compose**
+> Si Coolify ne permet pas le mode privilégié, voir la section "Déploiement direct" ci-dessous.
 
-### 6. Configurer les variables d'environnement
+### 6. Saisir les variables d'environnement
 
-Dans Coolify → Settings → Environment Variables, saisir toutes les variables du bloc ci-dessous.
-
-> Référence complète : [Variables à configurer](#variables-à-configurer-dans-coolify)
+Dans Coolify → Environment Variables, saisir le bloc ci-dessous.
 
 ### 7. Configurer les volumes
 
-Coolify gère les volumes Docker automatiquement depuis le `docker-compose.yml`.
+Coolify crée automatiquement les volumes Docker.
+Optionnellement : mapper `yeswesync-abctl-home` vers un volume DigitalOcean Block Storage pour la persistance entre recréations de Droplet.
 
-Vérifier que les volumes nommés sont bien listés dans Coolify → Volumes.
+### 8. Configurer le domaine et le reverse proxy
 
-### 8. Configurer le domaine
-
+Dans Coolify → Domains :
 ```
 Domain: yeswesync.votre-domaine.com
-Port: 8000
-HTTPS: activé (Coolify gère Let's Encrypt automatiquement)
+Target: localhost:8085
+Protocol: HTTP → HTTPS (Let's Encrypt auto)
 ```
 
-Le proxy Airbyte écoute sur le port 8000 en HTTP. Coolify terminera le TLS.
+> **Important :** Coolify doit proxyfier vers `localhost:8085` sur l'hôte — pas vers le port du container `airbyte-manager`. Airbyte est exposé directement sur l'hôte par le container kind.
 
 ### 9. Cliquer Deploy
 
 Coolify va :
-1. Cloner le repository
-2. Builder l'image `yeswesync-server:2.2.0` depuis le `Dockerfile` racine
-3. Démarrer tous les services dans l'ordre (dépendances déclarées dans compose)
-4. Attendre les healthchecks
-
-**Ordre de démarrage automatique :**
-```
-db (healthy)
-    → temporal (healthy) + bootloader (migrations)
-        → server (healthy)
-            → worker + webapp + connector-builder-server + cron
-                → proxy (healthy)
-```
+1. Builder l'image `yeswesync-manager:0.30.4`
+2. Démarrer `airbyte-manager` (container privilégié avec Docker socket)
+3. Démarrer `staging-db`
+4. L'entrypoint lance `abctl local install --chart-version 2.2.0`
+5. abctl crée le cluster kind + déploie Airbyte via Helm
+6. Airbyte devient accessible sur `localhost:8085` de l'hôte
 
 ### 10. Vérifier le démarrage
 
-Dans Coolify → Logs :
+Temps d'installation initial : **5-15 minutes**.
+
+Logs dans Coolify → airbyte-manager :
 ```
-[yeswesync] Environment OK — starting Airbyte server 2.2.0
+[yeswesync] Socket Docker OK
+[yeswesync] Docker engine hôte : v28.x.x
+[yeswesync] Installation d'Airbyte 2.2.0 via abctl...
+[yeswesync] SUCCESS Cluster 'airbyte-abctl' créé
+[yeswesync] SUCCESS Airbyte Chart installé
+[yeswesync] Airbyte accessible sur le port 8085 de l'hôte.
 ```
 
-Puis accéder à : `https://yeswesync.votre-domaine.com`
+Vérification sur le Droplet :
+```bash
+docker ps | grep airbyte-abctl-control-plane
+# → kindest/node:v1.32.2  0.0.0.0:8085->80/tcp  Up
+```
 
-Identifiants : `BASIC_AUTH_USERNAME` / `BASIC_AUTH_PASSWORD` configurés.
+### 11. Ouvrir YesWeSync
+
+```
+https://yeswesync.votre-domaine.com
+```
+
+Identifiants : email `emmanuelykpro@gmail.com` / `AIRBYTE_INITIAL_USER_PASSWORD`
+
+### 12. Vérifier le Connector Builder
+
+```
+UI → Builder → Créer un connecteur → Tester
+```
+
+Le Builder utilise le `manifest-server` dans le cluster kind — il doit fonctionner normalement.
+
+### 13. Vérifier un Sync
+
+```
+UI → Connections → New Connection → Source → Destination → Sync now
+```
+
+Les logs doivent montrer des Pods Kubernetes démarrés dans le cluster kind.
+
+---
+
+## Déploiement direct (sans container Coolify pour abctl)
+
+Si Coolify ne supporte pas les containers privilégiés, une alternative est de faire tourner abctl directement sur l'OS du Droplet.
+
+Sur le Droplet, en SSH :
+
+```bash
+# Installer abctl
+curl -fsSL https://github.com/airbytehq/abctl/releases/download/v0.30.4/abctl_0.30.4_linux_amd64.tar.gz \
+  | tar -xzC /usr/local/bin abctl
+
+# Créer le fichier values.yaml
+cat > /opt/yeswesync/values.yaml <<'EOF'
+global:
+  airbyteUrl: "https://yeswesync.votre-domaine.com"
+  auth:
+    enabled: true
+  jobs:
+    resources:
+      limits:
+        cpu: "3"
+        memory: "4Gi"
+  storage:
+    type: local
+postgresql:
+  image:
+    tag: "1.7.0-17"
+EOF
+
+# Installer Airbyte
+abctl local install \
+  --chart-version 2.2.0 \
+  --port 8085 \
+  --no-browser \
+  --values /opt/yeswesync/values.yaml
+```
+
+Dans ce cas, Coolify gère uniquement `staging-db` et le reverse proxy.
 
 ---
 
 ## Opérations courantes
 
-### Redéploiement (nouvelle version du compose/config)
+### Logs Airbyte
 
-```
-Coolify → Deployment → Redeploy
-```
-Les volumes persistent automatiquement. Aucune donnée perdue.
-
-### Restart d'un service
-
-```
-Coolify → Services → [service] → Restart
-```
-
-### Logs en temps réel
-
-```
-Coolify → Logs → [choisir le service]
-```
-
-Ou en SSH sur le Droplet :
 ```bash
-docker compose logs -f server
-docker compose logs -f worker
+# Sur le Droplet :
+export KUBECONFIG=~/.airbyte/abctl/abctl.kubeconfig
+kubectl logs -n airbyte-abctl deployment/airbyte-abctl-server -f
+kubectl logs -n airbyte-abctl deployment/airbyte-abctl-worker -f
 ```
 
-### Rollback vers une version précédente
+Ou via Coolify → Logs → airbyte-manager.
 
-1. Dans Coolify → Deployments → choisir un déploiement précédent
-2. Cliquer **Redeploy this version**
-3. Les volumes (données) ne sont PAS touchés par un rollback applicatif
+### Status Airbyte
+
+```bash
+abctl local status
+```
+
+### Redéploiement (config/variables changées)
+
+```
+Coolify → Redeploy
+```
+
+abctl détecte l'installation existante et met à jour la configuration. Les données sont préservées.
+
+### Rollback
+
+Airbyte déployé via abctl est versionné par Helm.
+
+```bash
+export KUBECONFIG=~/.airbyte/abctl/abctl.kubeconfig
+helm history airbyte-abctl -n airbyte-abctl
+helm rollback airbyte-abctl <REVISION> -n airbyte-abctl
+```
+
+Les données (PVs) ne sont pas touchées par un rollback Helm.
 
 ---
 
-## URL de staging pour YesWeReport
-
-Variable à configurer dans YesWeReport :
+## URL staging pour YesWeReport
 
 ```
-AIRBYTE_STAGING_DATABASE_URL=postgresql://staging:VOTRE_STAGING_PASSWORD@staging-db:5432/yeswesync_staging
+AIRBYTE_STAGING_DATABASE_URL=postgresql://staging:MOT_DE_PASSE@IP_PRIVEE_DROPLET:5433/yeswesync_staging
 ```
 
-Si YesWeReport et YesWeSync sont sur le même réseau Docker Coolify, utiliser le nom de service `staging-db`.
-
-Si séparés, exposer le port ou utiliser un réseau privé DigitalOcean et remplacer `staging-db` par l'IP privée du Droplet.
-
----
-
-## Branding YesWeSync (optionnel — post-déploiement)
-
-Le déploiement actuel utilise l'UI Airbyte officielle non modifiée.
-
-Si vous souhaitez activer le branding YesWeCange (logo, CSS) ultérieurement, référez-vous au fichier `branding/README.md`. **Cette étape modifie le bundle Airbyte et doit être une décision séparée.**
+Si YesWeReport tourne sur le même Droplet :
+```
+AIRBYTE_STAGING_DATABASE_URL=postgresql://staging:MOT_DE_PASSE@localhost:5433/yeswesync_staging
+```
 
 ---
 
 ## Variables à configurer dans Coolify
 
-### A. Airbyte core
+### Infrastructure / Airbyte
 
 | Variable | Obligatoire | Exemple | Description |
 |----------|:-----------:|---------|-------------|
-| `AIRBYTE_VERSION` | Oui | `2.2.0` | Version Airbyte (ne pas changer) |
-| `SECRET_PERSISTENCE` | Oui | `TESTING_CONFIG_DB_SECRET` | Stockage des secrets |
-| `TRACKING_STRATEGY` | Oui | `logging` | Désactiver la télémétrie Airbyte |
-| `AIRBYTE_ROLE` | Non | `community` | |
-| `WEBAPP_URL` | Oui | `https://yeswesync.votre-domaine.com` | URL publique |
-| `LOG_LEVEL` | Non | `INFO` | |
-| `WORKER_ENVIRONMENT` | Oui | `docker` | Mode d'exécution |
-| `AUTO_DETECT_SCHEMA` | Non | `true` | |
+| `AIRBYTE_URL` | **Oui** | `https://yeswesync.domain.com` | URL publique HTTPS |
+| `AIRBYTE_PORT` | Non | `8085` | Port hôte pour Airbyte |
+| `AIRBYTE_INITIAL_USER_PASSWORD` | **Oui** | `motdepasse` | Admin initial |
+| `AIRBYTE_INSTALLATION_ID` | Non | `uuid` | Auto-généré si vide |
+| `AIRBYTE_JOB_CPU_LIMIT` | Non | `3` | CPU max par job |
+| `AIRBYTE_JOB_MEMORY_LIMIT` | Non | `4Gi` | RAM max par job |
+| `ABCTL_EXTRA_FLAGS` | Non | `--low-resource-mode` | Pour Droplets < 8 Go |
 
-### B. Airbyte metadata PostgreSQL
-
-| Variable | Obligatoire | Exemple | Description |
-|----------|:-----------:|---------|-------------|
-| `DATABASE_USER` | Oui | `airbyte` | User metadata DB |
-| `DATABASE_PASSWORD` | Oui | `changeme` | **Choisir un mot de passe fort** |
-| `DATABASE_DB` | Oui | `airbyte` | Nom de la base |
-| `DATABASE_HOST` | Non | `db` | Nom du service (défaut: `db`) |
-| `DATABASE_PORT` | Non | `5432` | |
-
-### C. Staging PostgreSQL
+### Staging PostgreSQL
 
 | Variable | Obligatoire | Exemple | Description |
 |----------|:-----------:|---------|-------------|
-| `STAGING_USER` | Oui | `staging` | User staging DB |
-| `STAGING_PASSWORD` | Oui | `changeme` | **Choisir un mot de passe fort** |
-| `STAGING_DB` | Non | `yeswesync_staging` | Nom de la base staging |
+| `STAGING_USER` | **Oui** | `staging` | User DB staging |
+| `STAGING_PASSWORD` | **Oui** | `motdepasse` | Mot de passe fort |
+| `STAGING_DB` | Non | `yeswesync_staging` | Nom de la base |
+| `STAGING_PORT` | Non | `5433` | Port hôte |
 
-### D. Authentification / Réseau
+### YesWeReport (à configurer dans YesWeReport)
 
-| Variable | Obligatoire | Exemple | Description |
-|----------|:-----------:|---------|-------------|
-| `BASIC_AUTH_USERNAME` | Oui | `yeswesync` | Login accès UI |
-| `BASIC_AUTH_PASSWORD` | Oui | `changeme` | **Choisir un mot de passe fort** |
-| `PROXY_PORT` | Non | `8000` | Port HTTP proxy (Coolify forward) |
-
-### E. YesWeReport (à configurer dans YesWeReport)
-
-| Variable | Obligatoire | Exemple | Description |
-|----------|:-----------:|---------|-------------|
-| `AIRBYTE_STAGING_DATABASE_URL` | Oui | `postgresql://staging:PWD@staging-db:5432/yeswesync_staging` | URL staging pour YesWeReport |
+| Variable | Obligatoire | Exemple |
+|----------|:-----------:|---------|
+| `AIRBYTE_STAGING_DATABASE_URL` | **Oui** | `postgresql://staging:PWD@localhost:5433/yeswesync_staging` |
 
 ---
 
 ## Bloc `.env` prêt à copier dans Coolify
 
 ```env
-AIRBYTE_VERSION=2.2.0
-SECRET_PERSISTENCE=TESTING_CONFIG_DB_SECRET
-TRACKING_STRATEGY=logging
-AIRBYTE_ROLE=community
-WEBAPP_URL=https://yeswesync.VOTRE_DOMAINE.com
-LOG_LEVEL=INFO
-WORKER_ENVIRONMENT=docker
-AUTO_DETECT_SCHEMA=true
-
-DATABASE_USER=airbyte
-DATABASE_PASSWORD=
-DATABASE_DB=airbyte
-DATABASE_HOST=db
-DATABASE_PORT=5432
-
-BASIC_AUTH_USERNAME=yeswesync
-BASIC_AUTH_PASSWORD=
-PROXY_PORT=8000
+AIRBYTE_URL=https://yeswesync.VOTRE_DOMAINE.com
+AIRBYTE_PORT=8085
+AIRBYTE_INITIAL_USER_PASSWORD=
+AIRBYTE_INSTALLATION_ID=
+AIRBYTE_JOB_CPU_LIMIT=3
+AIRBYTE_JOB_MEMORY_LIMIT=4Gi
+ABCTL_EXTRA_FLAGS=
 
 STAGING_USER=staging
 STAGING_PASSWORD=
 STAGING_DB=yeswesync_staging
-
-AIRBYTE_STAGING_DATABASE_URL=postgresql://staging:STAGING_PASSWORD@staging-db:5432/yeswesync_staging
+STAGING_PORT=5433
 ```
 
-> Remplacer toutes les valeurs vides par vos secrets. Ne pas commiter ce fichier rempli.
+---
+
+## Contrainte Coolify importante à communiquer au lead
+
+Le container `airbyte-manager` nécessite **le mode privilégié** (`--privileged`) parce que kind (Kubernetes dans Docker) a besoin d'accès aux cgroups du système hôte.
+
+Dans Coolify, vérifier que :
+1. L'option "Privileged" est disponible pour les Docker services
+2. Le bind mount `/var/run/docker.sock` est autorisé
+
+Si Coolify ne le permet pas → utiliser le **déploiement direct** (abctl sur l'OS, section ci-dessus). Dans ce cas, Coolify ne gère que `staging-db` et le reverse proxy.
