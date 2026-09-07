@@ -4,3 +4,5 @@
 __pycache__/
 .DS_Store
 /tmp/
+# values.yaml généré par install.sh (contient l'installation ID)
+values.yaml
