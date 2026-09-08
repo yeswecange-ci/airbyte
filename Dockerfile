@@ -39,6 +39,8 @@ COPY entrypoint.sh ./entrypoint.sh
 RUN chmod +x install.sh entrypoint.sh
 
 # Airbyte est exposé sur le port 8085 de l'hôte par abctl/kind.
-# Ce container n'expose aucun port directement.
+# Avec --network host sur Coolify, container:8085 = hôte:8085 = Airbyte.
+EXPOSE 8085
+
 ENTRYPOINT ["/bin/bash"]
 CMD ["./entrypoint.sh"]

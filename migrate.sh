@@ -66,7 +66,7 @@ if ! command -v abctl &>/dev/null || ! abctl version 2>/dev/null | grep -q "${AB
     *)        fail "Architecture non supportée : ${ARCH}" ;;
   esac
   curl -fsSL \
-    "https://github.com/airbytehq/abctl/releases/download/v${ABCTL_VERSION}/abctl_${ABCTL_VERSION}_linux_${ARCH_SLUG}.tar.gz" \
+    "https://github.com/airbytehq/abctl/releases/download/v${ABCTL_VERSION}/abctl-v${ABCTL_VERSION}-linux-${ARCH_SLUG}.tar.gz" \
     | tar -xzC /usr/local/bin abctl
   chmod +x /usr/local/bin/abctl
   ok "abctl v${ABCTL_VERSION} installé"

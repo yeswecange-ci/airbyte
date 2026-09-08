@@ -73,7 +73,7 @@ else
 
   TMP_DIR=$(mktemp -d)
   curl -fsSL \
-    "https://github.com/airbytehq/abctl/releases/download/v${ABCTL_VERSION}/abctl_${ABCTL_VERSION}_linux_${ABCTL_ARCH}.tar.gz" \
+    "https://github.com/airbytehq/abctl/releases/download/v${ABCTL_VERSION}/abctl-v${ABCTL_VERSION}-linux-${ABCTL_ARCH}.tar.gz" \
     | tar -xzC "${TMP_DIR}" abctl
   install -m 755 "${TMP_DIR}/abctl" /usr/local/bin/abctl
   rm -rf "${TMP_DIR}"
