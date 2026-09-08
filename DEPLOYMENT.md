@@ -41,11 +41,20 @@ DigitalOcean Droplet Ubuntu 22.04
 │         ├── Réseau Docker normal
 │         └── Réseau kind (172.19.0.0/16)  ← ajouté par install.sh
 │
-├── abctl v0.30.4  (installé sur l'OS)
+├── abctl v0.30.4  (installé sur l'OS, ou dans le container yeswesync-tools)
 │
-└── Coolify  (optionnel — pour domaine/TLS/autres apps)
-    └── Reverse proxy → localhost:8085
+└── Coolify
+    ├── Traefik (réseau "coolify")  → domaine + TLS
+    └── yeswesync-tools (ce repo, Dockerfile)  ← réseaux "coolify" + "kind"
+          └── socat :8085 → airbyte-abctl-control-plane:80 (ingress Airbyte)
 ```
+
+**Pourquoi un relais socat ?** Traefik ne joint les containers que via le réseau Docker `coolify`.
+Airbyte, lui, est exposé par kind sur le port 8085 de l'*hôte* — ni `--network host`
+(le container sort du réseau `coolify` → *Bad Gateway*), ni un port du container ne
+suffisent. Le container `yeswesync-tools` se connecte donc lui-même au réseau `kind`
+(même technique que pour staging-db) et relaie `0.0.0.0:8085 → nœud kind:80`.
+Ce relais sert aussi à `abctl`, qui valide l'installation en appelant `http://localhost:8085`.
 
 ---
 
@@ -160,14 +169,28 @@ Résultat attendu en fin de script :
 
 ### 6. Configurer le domaine avec Coolify (ou nginx)
 
-**Option A — Coolify (déjà installé)**
+**Option A — Coolify (recommandé : déploiement complet depuis ce repo)**
 
-Dans Coolify → Add Resource → Custom Domain :
+Dans Coolify → New Resource → Public/Private Repository → ce repo, build pack **Dockerfile** :
+
+| Réglage | Valeur |
+|---------|--------|
+| Domain | `https://airbyte.ywcdigital.com` |
+| Ports Exposes | `8085` |
+| Storages → Bind mount | `/var/run/docker.sock` → `/var/run/docker.sock` |
+| Storages → Bind mount | `/root/.airbyte` → `/root/.airbyte` (même chemin des deux côtés — kind bind-monte ce chemin depuis l'hôte) |
+| Custom Docker Options | **vide** — surtout pas `--network host` (sinon *Bad Gateway*) |
+| Env | `AIRBYTE_URL=https://airbyte.ywcdigital.com`, `AIRBYTE_INITIAL_USER_PASSWORD`, `STAGING_USER`, `STAGING_PASSWORD` |
+
+Au premier déploiement, `entrypoint.sh` lance `install.sh` : compter **5 à 15 minutes**
+pendant lesquelles le domaine répond *Bad Gateway* (normal, Airbyte n'est pas encore up).
+Suivre l'avancement dans Coolify → Logs. Attendu à la fin :
 ```
-Domain: yeswesync.votre-domaine.com
-Proxy to: http://localhost:8085
+[yeswesync] relais 0.0.0.0:8085 → 172.19.0.2:80 (ingress Airbyte)
+[yeswesync] ✓ install.sh terminé — Airbyte installé
 ```
-Coolify gère Let's Encrypt automatiquement.
+Coolify gère Let's Encrypt automatiquement. Les redéploiements suivants sont rapides :
+kind est déjà là, le container ne fait que relancer le relais.
 
 **Option B — nginx sur l'OS**
 ```bash
@@ -230,6 +253,7 @@ Au reboot :
 3. Kubernetes dans kind recharge depuis ses données persistantes
 4. Les Pods Airbyte se réschedulisent
 5. Le service systemd `yeswesync-reboot` se lance et reconnecte `staging-db` au réseau kind
+   (déploiement Coolify : c'est le container `yeswesync-tools`, redémarré par Coolify, qui s'en charge via `entrypoint.sh`)
 
 **Temps de récupération :** 2 à 5 minutes après reboot.
 

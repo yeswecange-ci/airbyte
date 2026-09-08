@@ -228,6 +228,9 @@ else
 fi
 
 # ── 8. Service systemd pour survivre au reboot ───────────────────────────────
+# Uniquement quand le script tourne directement sur l'hôte. Dans le container
+# Coolify il n'y a pas de systemd : c'est entrypoint.sh qui joue ce rôle.
+if [[ -d /run/systemd/system ]] && command -v systemctl > /dev/null 2>&1; then
 log "Installation du service systemd pour la persistance au reboot..."
 cat > /etc/systemd/system/yeswesync-reboot.service <<'SYSTEMD'
 [Unit]
@@ -297,6 +300,9 @@ chmod +x /usr/local/bin/yeswesync-reboot.sh
 systemctl daemon-reload
 systemctl enable yeswesync-reboot.service
 ok "Service systemd yeswesync-reboot installé et activé"
+else
+  log "Pas de systemd (exécution dans le container Coolify) — reconnexion au reboot assurée par entrypoint.sh"
+fi
 
 # ── 9. Résumé ─────────────────────────────────────────────────────────────────
 log ""
