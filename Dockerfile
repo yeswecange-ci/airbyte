@@ -37,7 +37,7 @@ ARG ABCTL_VERSION=0.30.4
 ARG TARGETARCH=amd64
 
 RUN curl -fsSL \
-    "https://github.com/airbytehq/abctl/releases/download/v${ABCTL_VERSION}/abctl_${ABCTL_VERSION}_linux_${TARGETARCH}.tar.gz" \
+    "https://github.com/airbytehq/abctl/releases/download/v${ABCTL_VERSION}/abctl-v${ABCTL_VERSION}-linux-${TARGETARCH}.tar.gz" \
     | tar -xzC /usr/local/bin abctl \
     && chmod +x /usr/local/bin/abctl
 
