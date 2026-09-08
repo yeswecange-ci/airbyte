@@ -1,28 +1,22 @@
-# YesWeSync — image utilitaire de déploiement (optionnelle)
+# YesWeSync — image utilitaire de déploiement
 #
-# Ce Dockerfile produit une image contenant abctl et nos scripts.
-# Il NE remplace PAS le runtime Airbyte.
+# Ce container installe abctl puis Airbyte via :
+#   abctl local install --port 8085 --no-browser
 #
-# Airbyte 2.2.0 tourne via abctl → kind → Kubernetes DIRECTEMENT SUR LE DROPLET.
-# Ce n'est pas un container Airbyte. C'est un outil d'installation/vérification.
+# Il NE modifie PAS Airbyte. Airbyte tourne via abctl → kind → Kubernetes.
 #
-# Usage possible (optionnel — voir DEPLOYMENT.md section "Déploiement direct") :
-#
-#   docker build -t yeswesync-tools .
+# Usage Coolify / docker run :
 #   docker run --rm \
-#     --pid=host --network=host --privileged \
+#     --network host --privileged \
 #     -v /var/run/docker.sock:/var/run/docker.sock \
 #     -v /root/.airbyte:/root/.airbyte \
-#     -e STAGING_USER=... \
+#     -e AIRBYTE_INITIAL_USER_PASSWORD=... \
 #     -e STAGING_PASSWORD=... \
-#     -e AIRBYTE_URL=... \
 #     yeswesync-tools ./install.sh
 #
-# AIRBYTE SOURCE CODE MODIFIED:    NO
-# AIRBYTE FRONTEND MODIFIED:       NO
-# AIRBYTE BACKEND MODIFIED:        NO
-# AIRBYTE BUNDLE PATCHED:          NO
-# AIRBYTE ENGINE MODIFIED:         NO
+# AIRBYTE SOURCE CODE MODIFIED: NO
+# AIRBYTE FRONTEND MODIFIED:    NO
+# AIRBYTE BACKEND MODIFIED:     NO
 
 FROM ubuntu:22.04
 
@@ -32,21 +26,19 @@ RUN apt-get update && apt-get install -y \
     curl ca-certificates python3 util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-# abctl v0.30.4 — version utilisée et validée avec Airbyte 2.2.0
-ARG ABCTL_VERSION=0.30.4
-ARG TARGETARCH=amd64
-
-RUN curl -fsSL \
-    "https://github.com/airbytehq/abctl/releases/download/v${ABCTL_VERSION}/abctl-v${ABCTL_VERSION}-linux-${TARGETARCH}.tar.gz" \
-    | tar -xzC /usr/local/bin abctl \
-    && chmod +x /usr/local/bin/abctl
+# Install abctl v0.30.4 via the official Airbyte installer script.
+# RELEASE_TAG pins the version. TELEMETRY_ENABLED=0 suppresses analytics.
+ARG ABCTL_VERSION=v0.30.4
+RUN curl -LsfS https://get.airbyte.com -o /tmp/abctl-install.sh \
+    && RELEASE_TAG=${ABCTL_VERSION} TELEMETRY_ENABLED=0 bash /tmp/abctl-install.sh \
+    && rm /tmp/abctl-install.sh
 
 WORKDIR /yeswesync
 COPY install.sh    ./install.sh
 COPY entrypoint.sh ./entrypoint.sh
 RUN chmod +x install.sh entrypoint.sh
 
-# Ce container ne sert pas de port HTTP.
-# Airbyte est exposé par le container kind sur l'hôte (port AIRBYTE_PORT).
+# Airbyte est exposé sur le port 8085 de l'hôte par abctl/kind.
+# Ce container n'expose aucun port directement.
 ENTRYPOINT ["/bin/bash"]
 CMD ["./entrypoint.sh"]
